@@ -377,7 +377,10 @@ static void write_root_script(void) {
     "diag '[*] restarting zygote (stop; start) — keeping SELinux permissive'\n"
     "stop\n"
     "start\n"
-    "diag '[+] zygote restart issued; SELinux left permissive'\n"
+    "/data/adb/apd post-fs-data\n"
+    "/data/adb/apd services\n"
+    "/data/adb/apd boot-completed\n"
+    "setenforce 1\n"
     "diag '[*]' $(id) 'enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
     "report_status ready\n"
     "diag '[+] done'\n";
