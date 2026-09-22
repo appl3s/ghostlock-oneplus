@@ -249,10 +249,17 @@ def main() -> int:
     report.check("git", check_command("git"))
     report.check("uv", check_command("uv"))
 
+    magiskboot_required = args.require_magiskboot or bool(os.environ.get("MAGISKBOOT_PATH"))
     try:
         magisk = required_env("MAGISK_REPO_DIR")
     except RuntimeError as error:
-        report.fail("MAGISK_REPO_DIR", str(error))
+        if magiskboot_required:
+            report.fail("MAGISK_REPO_DIR", str(error))
+        else:
+            report.warn(
+                "MAGISK_REPO_DIR",
+                "MAGISK_REPO_DIR is unset; set it only when the magiskboot extractor is needed",
+            )
         magisk = None
     try:
         vmlinux_to_elf = required_env("VMLINUX_TO_ELF_REPO_DIR")
