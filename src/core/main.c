@@ -274,7 +274,7 @@ static int check_selinux_off(void) {
 static int wait_for_ksu_status(void) {
   static const char status_path[] = "/data/local/tmp/.ghostlock_ksu.status";
 
-  for (int attempt = 1; attempt <= 40; attempt++) {
+  for (int attempt = 1; attempt <= 80; attempt++) {
     char status[128] = {0};
     int fd = open(status_path, O_RDONLY);
     if (fd >= 0) {
@@ -293,7 +293,7 @@ static int wait_for_ksu_status(void) {
       }
     }
     if (attempt == 1 || attempt % 10 == 0) {
-      pr_info("waiting for root script status (%d/40)\n", attempt);
+      pr_info("waiting for root script status (%d/80)\n", attempt);
     }
     sleep(1);
   }
@@ -412,7 +412,6 @@ static void write_root_script(void) {
     "sleep 5\n"
     "/data/adb/apd services\n"
     "/data/adb/apd boot-completed\n"
-    "/data/adb/apd late-load\n"
     // "setenforce 1\n"
     "diag '[*]' $(id) 'enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
     "report_status ready\n"
