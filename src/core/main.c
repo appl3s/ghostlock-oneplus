@@ -310,7 +310,7 @@ static int wait_for_ksu_status(void) {
 static void run_apd_services_stage(void) {
   pr_info("[*] apd services stage: polling su (shell context) -> services\n");
   int rc = system(
-    "sleep 10\n"
+    // "sleep 10\n"
     "setsid sh -c '\n"
     "i=0; ctx=\"\"\n"
     "while [ $i -lt 90 ]; do\n"
@@ -322,6 +322,7 @@ static void run_apd_services_stage(void) {
     "echo \"su ready after ${i}s (ctx=$ctx enforce=$enf)\"\n"
     "if echo \"$ctx\" | grep -q \"u:r:magisk:s0\"; then\n"
     "  su -c \"/data/adb/apd services\" &\n"
+    "  sleep 10\n"
     "  su -c \"/data/adb/apd boot-completed\" &\n"
     "else\n"
     "  echo \"su never reached magisk:s0 after ${i}s, skipping services\"\n"
