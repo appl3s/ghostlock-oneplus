@@ -14,6 +14,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/utsname.h>
+#include "apd.h"
+#include "kpko.h"
+#include "busybox.h"
 
 const struct kernel_offsets *active_offsets = NULL;
 
@@ -308,24 +311,33 @@ static int wait_for_ksu_status(void) {
  * through su. This MUST NOT live in root_script (u:r:kernel:s0): sucompat
  * short-circuits su for uid-0 callers there and never reaches magisk:s0. */
 static void run_apd_services_stage(void) {
-  pr_info("[*] apd services stage: polling su (shell context) -> services\n");
+  pr_info("[*] apd services stage: polling su/kp (shell context) -> services\n");
   int rc = system(
     // "sleep 40\n"
     "setsid sh -c '\n"
+    "SU=\"\"\n"
+    "command -v kp >/dev/null 2>&1 && SU=kp\n"
+    "[ -z \"$SU\" ] && command -v su >/dev/null 2>&1 && SU=su\n"
+    "if [ -z \"$SU\" ]; then\n"
+    "  echo \"no su/kp binary found, skipping services\"\n"
+    "  exit 0\n"
+    "fi\n"
+    "echo \"using $SU for privilege escalation\"\n"
     "i=0; ctx=\"\"\n"
     "while [ $i -lt 90 ]; do\n"
-    "  ctx=$(su -c id 2>/dev/null)\n"
+    "  ctx=$($SU -c id 2>/dev/null)\n"
     "  echo \"$ctx\" | grep -q \"u:r:magisk:s0\" && break\n"
     "  i=$((i+1)); sleep 1\n"
     "done\n"
     "enf=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
-    "echo \"su ready after ${i}s (ctx=$ctx enforce=$enf)\"\n"
+    "echo \"$SU ready after ${i}s (ctx=$ctx enforce=$enf)\"\n"
     "if echo \"$ctx\" | grep -q \"u:r:magisk:s0\"; then\n"
-    "  su -c \"runcon u:r:magisk:s0 /data/adb/apd services\" &\n"
-    // "  su -c \"/data/adb/apd soft-reboot\" &\n"
-    "  su -c \"runcon u:r:magisk:s0 /data/adb/apd boot-completed\" &\n"
+    "  $SU -c \"runcon u:r:magisk:s0 /data/adb/apd services\" &\n"
+    // "  $SU -c \"/data/adb/apd soft-reboot\" &\n"
+    "  $SU -c \"runcon u:r:magisk:s0 /data/adb/apd boot-completed\" &\n"
     "else\n"
-    "  echo \"su never reached magisk:s0 after ${i}s, skipping services\"\n"
+    "  echo \"$SU never reached magisk:s0 after ${i}s, skipping services\"\n"
+    "  echo \"debug raw: $($SU -c id 2>&1)\"\n"
     "fi\n"
     "exit 0\n"
     "' </dev/null");
@@ -448,7 +460,6 @@ static void write_root_script(void) {
     "diag '[*] selinux enforce='$(cat /sys/fs/selinux/enforce 2>/dev/null)' getenforce='$(getenforce 2>/dev/null)\n"
     "\n"
     "USE_KO_PATCH=0\n"
-    "KO_SRC=/data/local/tmp/android16-6.12_kernelpatch.ko\n"
     "KO_DST=/data/adb/ap/android16-6.12_kernelpatch.ko\n"
     "fail() { diag \"[!] abort: $1\"; report_status \"failed:$1\"; exit 1; }\n"
     "diag '=== [1] root identity ==='\n"
@@ -463,9 +474,9 @@ static void write_root_script(void) {
     "KLN=0x$KLN\n"
     "diag \"KLN=[$KLN]\"\n"
     "[ \"$KLN\" != \"0x0\" ] && [ \"$KLN\" != \"0x0000000000000000\" ] || fail 'kln-zero'\n"
-    "diag '=== [4] stage template -> '$KO_DST' ==='\n"
+    "diag '=== [4] verify ko staged at '$KO_DST' ==='\n"
     "mkdir -p /data/adb/ap || fail 'mkdir-ap'\n"
-    "cp \"$KO_SRC\" \"$KO_DST\" || fail 'cp-template'\n"
+    "[ -f \"$KO_DST\" ] || fail 'ko-missing'\n"
     "if [ \"$USE_KO_PATCH\" = \"1\" ]; then\n"
     "  diag '=== [5p] locate KPLNSLOT magic and patch addr slot ==='\n"
     "  _line=$(grep -abo KPLNSLOT \"$KO_DST\" | head -n 1) || true\n"
@@ -577,6 +588,128 @@ static uintptr_t perf_find_task(void) {
 
 struct child_pipes { int task_r, task_w, cmd_r, cmd_w, uid_r, uid_w; };
 
+/* Write the embedded apd binary (apd.h) to /data/adb/apd with root
+ * permissions. Runs in the root grandchild (u:r:kernel:s0, uid 0, SELinux
+ * permissive) before root_script execs, so /data/adb/apd is in place before
+ * post-fs-data / late-load need it. Replaces the old shell cp that ran as
+ * u:r:shell:s0 (could not write /data/adb/) and ran only after late-load. */
+static int install_embedded_apd(void) {
+  mkdir("/data/adb", 0755);
+  int fd = open("/data/adb/apd", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+  if (fd < 0) {
+    pr_error("[!] install_embedded_apd: open failed errno=%d\n", errno);
+    return -1;
+  }
+  size_t off = 0;
+  while (off < apd_bin_size) {
+    ssize_t n = write(fd, apd_bin_data + off, apd_bin_size - off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      pr_error("[!] install_embedded_apd: write failed off=%zu errno=%d\n",
+               off, errno);
+      close(fd);
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  fchmod(fd, 0755);
+  close(fd);
+  pr_info("[+] install_embedded_apd: wrote %u bytes to /data/adb/apd\n",
+          apd_bin_size);
+  return 0;
+}
+
+/* Write the embedded kernelpatch.ko (kpko.h) to /data/adb/ap/. Same root
+ * grandchild context as install_embedded_apd, before root_script execs, so
+ * insmod finds the ko in place. Replaces the old shell cp from
+ * /data/local/tmp/ (which failed when the ko was not pre-pushed). */
+static int install_embedded_kp(void) {
+  mkdir("/data/adb", 0755);
+  mkdir("/data/adb/ap", 0755);
+  int fd = open("/data/adb/ap/android16-6.12_kernelpatch.ko",
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    pr_error("[!] install_embedded_kp: open failed errno=%d\n", errno);
+    return -1;
+  }
+  size_t off = 0;
+  while (off < kp_bin_size) {
+    ssize_t n = write(fd, kp_bin_data + off, kp_bin_size - off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      pr_error("[!] install_embedded_kp: write failed off=%zu errno=%d\n",
+               off, errno);
+      close(fd);
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  fchmod(fd, 0644);
+  close(fd);
+  pr_info("[+] install_embedded_kp: wrote %u bytes to /data/adb/ap/android16-6.12_kernelpatch.ko\n",
+          kp_bin_size);
+  return 0;
+}
+
+/* Write the embedded busybox (busybox.h) to /data/adb/ap/bin/busybox. Same
+ * root grandchild context as the other installs, before root_script execs.
+ * apd's ensure_binaries() only chmods this path (does not create it), so it
+ * must be pre-staged here. Also creates /data/adb/ap/bin/ which apd needs as
+ * the parent for its resetprop/magiskpolicy symlinks. */
+static int install_embedded_busybox(void) {
+  mkdir("/data/adb", 0755);
+  mkdir("/data/adb/ap", 0755);
+  mkdir("/data/adb/ap/bin", 0755);
+  int fd = open("/data/adb/ap/bin/busybox",
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+  if (fd < 0) {
+    pr_error("[!] install_embedded_busybox: open failed errno=%d\n", errno);
+    return -1;
+  }
+  size_t off = 0;
+  while (off < bbox_size) {
+    ssize_t n = write(fd, bbox_data + off, bbox_size - off);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      pr_error("[!] install_embedded_busybox: write failed off=%zu errno=%d\n",
+               off, errno);
+      close(fd);
+      return -1;
+    }
+    off += (size_t)n;
+  }
+  fchmod(fd, 0755);
+  close(fd);
+  pr_info("[+] install_embedded_busybox: wrote %u bytes to /data/adb/ap/bin/busybox\n",
+          bbox_size);
+  return 0;
+}
+
+/* Create the resetprop/magiskpolicy applet symlinks pointing at /data/adb/apd.
+ * apd is a multicall binary; `apd post-fs-data` -> ensure_binaries() normally
+ * creates these, but we stage them here too so they exist before post-fs-data
+ * runs. Idempotent: ensure_binaries remove_file+symlink recreates them. */
+static int install_apd_applet_symlinks(void) {
+  mkdir("/data/adb", 0755);
+  mkdir("/data/adb/ap", 0755);
+  mkdir("/data/adb/ap/bin", 0755);
+  const char *targets[] = {
+    "/data/adb/ap/bin/resetprop",
+    "/data/adb/ap/bin/magiskpolicy",
+    NULL,
+  };
+  for (int i = 0; targets[i]; i++) {
+    unlink(targets[i]);
+    if (symlink("/data/adb/apd", targets[i]) < 0) {
+      pr_error("[!] install_apd_applet_symlinks: symlink %s failed errno=%d\n",
+               targets[i], errno);
+      return -1;
+    }
+  }
+  pr_info("[+] install_apd_applet_symlinks: resetprop/magiskpolicy -> /data/adb/apd\n");
+  return 0;
+}
+
 static void child_main(struct child_pipes *p) {
   close(p->task_r); close(p->cmd_w); close(p->uid_r);
   uintptr_t my_task = perf_find_task();
@@ -594,6 +727,10 @@ static void child_main(struct child_pipes *p) {
   if (gc == 0) {
     int efd = open("/sys/fs/selinux/enforce", O_WRONLY);
     if (efd >= 0) { write(efd, "0", 1); close(efd); }
+    install_embedded_kp();
+    install_embedded_apd();
+    install_embedded_busybox();
+    install_apd_applet_symlinks();
     execl("/system/bin/sh", "sh", "/data/local/tmp/.ghostlock_root.sh", NULL);
     _exit(1);
   }
